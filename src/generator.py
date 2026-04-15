@@ -1,8 +1,28 @@
-import textwrap, re
+import textwrap, re, time
 from llama_cpp import Llama, LlamaRAMCache
+from prompt_cache import PromptCache
 
 ANSWER_START = "<<<ANSWER>>>"
 ANSWER_END   = "<<<END>>>"
+
+
+_cache: PromptCache = PromptCache(strategy="exact")   # safe default; no embed_fn needed
+ 
+def configure_cache(strategy: str = "semantic", threshold: float = 0.90, embed_fn=None):
+    """
+    Call once after your retriever is ready, e.g.:
+ 
+        configure_cache(strategy="semantic", embed_fn=retriever.embed)
+        configure_cache(strategy="exact")   # no embed_fn needed
+    """
+    global _cache
+    _cache = PromptCache(strategy=strategy, threshold=threshold, embed_fn=embed_fn)
+ 
+def get_cache_stats() -> dict:
+    return _cache.stats()
+ 
+def clear_cache():
+    _cache.clear()
 
 def text_cleaning(prompt):
     _CONTROL_CHARS_RE = re.compile(r'[\u0000-\u001F\u007F-\u009F]')
@@ -154,33 +174,71 @@ def run_llama_cpp(prompt: str, model_path: str, max_tokens: int, temperature: fl
         stop=[ANSWER_END]
     )
 
-def answer(query: str, chunks, model_path: str, max_tokens: int = 300, system_prompt_mode: str = "tutor", temperature: float = 0.2):
+# ---------------------------------------------------------------------------
+# answer() — cache-aware
+# ---------------------------------------------------------------------------
+ 
+def answer(
+    query: str,
+    chunks,
+    model_path: str,
+    max_tokens: int = 300,
+    system_prompt_mode: str = "tutor",
+    temperature: float = 0.2,
+    use_cache: bool = True,
+):
+    # Cache lookup
+    if use_cache:
+        cached = _cache.get(query)
+        if cached is not None:
+            def _hit():
+                yield cached
+            return _hit()
+ 
+    # Cache miss — run LLM, collect response, store it
     prompt = format_prompt(chunks, query, system_prompt_mode=system_prompt_mode)
-    return stream_llama_cpp(prompt, model_path, max_tokens=max_tokens, temperature=temperature)
-
-def double_answer(query: str, chunks, model_path: str,
-                  max_tokens: int = 300,
-                  system_prompt_mode: str = "tutor",
-                  temperature: float = 0.2):
-
-    # ---- Pass 1 ----
-    base_prompt = format_prompt(
-        chunks,
-        query,
-        system_prompt_mode=system_prompt_mode
-    )
-
-    initial_stream = stream_llama_cpp(
-        base_prompt,
-        model_path,
-        max_tokens,
-        temperature
-    )
-
-    initial_response = "".join(initial_stream)
-    initial_response = dedupe_generated_text(initial_response)
-
-    # ---- Pass 2 (repeat SAME question) ----
+ 
+    def _stream_and_store():
+        tokens = []
+        t0 = time.time()
+        for delta in stream_llama_cpp(prompt, model_path, max_tokens, temperature):
+            tokens.append(delta)
+            yield delta
+        if use_cache:
+            _cache.put(query, "".join(tokens), llm_latency_s=time.time() - t0)
+ 
+    return _stream_and_store()
+ 
+ 
+# ---------------------------------------------------------------------------
+# double_answer() — cache on first pass only
+# ---------------------------------------------------------------------------
+ 
+def double_answer(
+    query: str,
+    chunks,
+    model_path: str,
+    max_tokens: int = 300,
+    system_prompt_mode: str = "tutor",
+    temperature: float = 0.2,
+    use_cache: bool = True,
+):
+    base_prompt = format_prompt(chunks, query, system_prompt_mode=system_prompt_mode)
+ 
+    # Pass 1 — try cache
+    initial_response = _cache.get(query) if use_cache else None
+ 
+    if initial_response is None:
+        t0 = time.time()
+        initial_response = dedupe_generated_text(
+            "".join(stream_llama_cpp(base_prompt, model_path, max_tokens, temperature))
+        )
+        if use_cache:
+            _cache.put(query, initial_response, llm_latency_s=time.time() - t0)
+    else:
+        initial_response = dedupe_generated_text(initial_response)
+ 
+    # Pass 2 — always fresh
     repeated_prompt = (
         base_prompt
         + initial_response
@@ -192,13 +250,8 @@ def double_answer(query: str, chunks, model_path: str,
         + "<|im_start|>assistant\n"
         + ANSWER_START
     )
-
-    return stream_llama_cpp(
-        repeated_prompt,
-        model_path,
-        max_tokens,
-        temperature
-    )
+ 
+    return stream_llama_cpp(repeated_prompt, model_path, max_tokens, temperature)
 
 def dedupe_generated_text(text: str) -> str:
     """
