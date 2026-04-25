@@ -189,7 +189,7 @@ def answer(
 ):
     # Cache lookup
     if use_cache:
-        cached = _cache.get(query)
+        cached = _cache.get(query, chunks)
         if cached is not None:
             def _hit():
                 yield cached
@@ -205,7 +205,7 @@ def answer(
             tokens.append(delta)
             yield delta
         if use_cache:
-            _cache.put(query, "".join(tokens), llm_latency_s=time.time() - t0)
+            _cache.put(query, "".join(tokens), chunks=chunks, llm_latency_s=time.time() - t0)
  
     return _stream_and_store()
  
@@ -226,7 +226,7 @@ def double_answer(
     base_prompt = format_prompt(chunks, query, system_prompt_mode=system_prompt_mode)
  
     # Pass 1 — try cache
-    initial_response = _cache.get(query) if use_cache else None
+    initial_response = _cache.get(query, chunks) if use_cache else None
  
     if initial_response is None:
         t0 = time.time()
@@ -234,7 +234,7 @@ def double_answer(
             "".join(stream_llama_cpp(base_prompt, model_path, max_tokens, temperature))
         )
         if use_cache:
-            _cache.put(query, initial_response, llm_latency_s=time.time() - t0)
+            _cache.put(query, initial_response, llm_latency_s=time.time() - t0, chunks=chunks)
     else:
         initial_response = dedupe_generated_text(initial_response)
  
